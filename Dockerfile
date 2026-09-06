@@ -25,8 +25,15 @@ WORKDIR /app
 
 # ---------------------------------------------------------------
 # Stage 1 — dependencias (cacheado hasta que cambie package*.json)
+#
+# `corepack` fija la versión de npm declarada en el campo
+# "packageManager" de package.json, para que el `npm ci` del build
+# resuelva el lockfile igual que en local y no falle por peers
+# opcionales (p. ej. @swc/helpers) que otras versiones de npm
+# escriben u omiten de forma distinta.
 # ---------------------------------------------------------------
 FROM base AS deps
+RUN corepack enable npm
 COPY package.json package-lock.json ./
 RUN npm ci
 
