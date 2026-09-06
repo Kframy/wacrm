@@ -1,24 +1,44 @@
 # syntax=docker/dockerfile:1
 
+# ===============================================================
+# wacrm — imagen de producción (Next.js 16, salida standalone)
+#
+# Pensada para EasyPanel (App → Build → Dockerfile), pero sirve
+# igual con `docker build` / `docker compose` (ver docs/docker.md).
+#
+# EasyPanel: las variables que definas en la pestaña "Environment"
+# del servicio se pasan automáticamente como `--build-arg` durante
+# el build Y como variables de entorno en runtime. Por eso los
+# `NEXT_PUBLIC_*` de abajo sólo necesitan estar declarados como ARG:
+# EasyPanel los rellena. Los secretos server-only (SERVICE_ROLE_KEY,
+# ENCRYPTION_KEY, META_APP_SECRET, ...) NO se declaran como ARG para
+# que no queden horneados en la imagen; se leen en runtime.
+# ===============================================================
+
 # ---------------------------------------------------------------
-# Stage 1 — install dependencies (cached until package*.json change)
+# Base — Node fijado + compat glibc para sharp (optimización de
+# imágenes de Next) sobre Alpine/musl.
 # ---------------------------------------------------------------
-FROM node:20-alpine AS deps
+FROM node:20-alpine AS base
+RUN apk add --no-cache libc6-compat
 WORKDIR /app
+
+# ---------------------------------------------------------------
+# Stage 1 — dependencias (cacheado hasta que cambie package*.json)
+# ---------------------------------------------------------------
+FROM base AS deps
 COPY package.json package-lock.json ./
 RUN npm ci
 
 # ---------------------------------------------------------------
 # Stage 2 — build
 #
-# NEXT_PUBLIC_* values are inlined into the client bundle at build
-# time, so they must be provided as build args (docker-compose.yml
-# forwards them from .env.local). Server-only secrets (service role
-# key, ENCRYPTION_KEY, META_APP_SECRET, ...) are read at runtime and
-# must NOT be baked into the image.
+# Los NEXT_PUBLIC_* se inyectan en el bundle de cliente en tiempo
+# de build, así que llegan como build args. Si cambias cualquiera
+# de ellos en EasyPanel hay que reconstruir (Deploy con rebuild),
+# no basta reiniciar.
 # ---------------------------------------------------------------
-FROM node:20-alpine AS builder
-WORKDIR /app
+FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
@@ -35,10 +55,9 @@ ENV NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL \
 RUN npm run build
 
 # ---------------------------------------------------------------
-# Stage 3 — minimal runtime (standalone output)
+# Stage 3 — runtime mínimo (sólo el bundle standalone)
 # ---------------------------------------------------------------
-FROM node:20-alpine AS runner
-WORKDIR /app
+FROM base AS runner
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
     PORT=3000 \
@@ -52,4 +71,11 @@ COPY --from=builder --chown=nextjs:nextjs /app/public ./public
 
 USER nextjs
 EXPOSE 3000
+
+# EasyPanel/Swarm usa este healthcheck para marcar el contenedor
+# como sano antes de enrutar tráfico. 200-499 cuentan como vivo
+# (p. ej. el 307 de la home a /login cuando no hay sesión).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+
 CMD ["node", "server.js"]
